@@ -1,0 +1,109 @@
+name: Decompile Grindr APK
+
+on:
+  workflow_dispatch:
+  # schedule:
+  #   - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      PACKAGE: com.grindrapp.android
+      JADX_VERSION: 1.5.5
+      APKEEP_VERSION: 1.0.0
+
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip file openjdk-17-jre-headless
+
+      - name: Install apkeep
+        run: |
+          # GitHub-hosted ubuntu-latest is x86_64, but pick the matching
+          # prebuilt binary so this also runs natively on arm64 runners (and
+          # under `act` on Apple Silicon).
+          case "$(uname -m)" in
+            x86_64)        ARCH=x86_64 ;;
+            aarch64|arm64) ARCH=aarch64 ;;
+            *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
+          esac
+          curl -fL -o apkeep \
+            "https://github.com/EFForg/apkeep/releases/download/${APKEEP_VERSION}/apkeep-${ARCH}-unknown-linux-gnu"
+          chmod +x apkeep
+          sudo mv apkeep /usr/local/bin/apkeep
+          apkeep --version
+
+      - name: Download APK (apkeep, APKPure, no auth)
+        run: |
+          set -euo pipefail
+          mkdir -p apks
+
+          # apkeep's default download source is apk-pure, which needs no
+          # account or token and runs non-interactively. For an app with
+          # splits (like Grindr) it produces a single <package>.xapk bundle;
+          # simpler apps come down as <package>.apk. Retry purely for network
+          # robustness.
+          attempt=0
+          max=3
+          until [ "$attempt" -ge "$max" ]; do
+            attempt=$((attempt + 1))
+            echo "::group::Attempt ${attempt}/${max}: apkeep download"
+            if apkeep -a "$PACKAGE" -d apk-pure apks; then
+              echo "::endgroup::"
+              break
+            fi
+            echo "::endgroup::"
+            echo "Download failed; retrying in 5s..."
+            sleep 5
+          done
+
+          echo "=== downloaded files ==="
+          ls -lhR apks
+          if [ -z "$(find apks -maxdepth 1 -type f \( -name '*.xapk' -o -name '*.apk' -o -name '*.apkm' \) -print -quit)" ]; then
+            echo "::error::No APK/XAPK downloaded after ${max} attempts."
+            exit 1
+          fi
+
+      - name: Install jadx
+        run: |
+          curl -fL -o jadx.zip \
+            "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
+          unzip -q jadx.zip -d jadx
+          chmod +x jadx/bin/jadx
+
+      - name: Decompile
+        run: |
+          # Hand jadx whatever apkeep produced (.xapk bundle or plain .apk);
+          # it reads the bundle and merges base + split APKs into one tree.
+          mapfile -t INPUTS < <(find apks -maxdepth 1 -type f \( -name '*.xapk' -o -name '*.apk' -o -name '*.apkm' \))
+          echo "Decompiling: ${INPUTS[*]}"
+          ./jadx/bin/jadx --no-debug-info --threads-count 2 -d out "${INPUTS[@]}" || true
+          # `| head` + pipefail/errexit (GitHub's default shell) would fail the
+          # step via SIGPIPE once ls outruns head, so swallow the pipe result.
+          ls -R out 2>/dev/null | head -n 50 || true
+
+      - name: Strip binary / media assets, keep XML + sources
+        run: |
+          find out -type f \( \
+            -iname '*.png'  -o -iname '*.jpg'  -o -iname '*.jpeg' -o \
+            -iname '*.webp' -o -iname '*.gif'  -o -iname '*.bmp'  -o \
+            -iname '*.mp3'  -o -iname '*.mp4'  -o -iname '*.webm' -o \
+            -iname '*.ogg'  -o -iname '*.wav'  -o -iname '*.m4a'  -o \
+            -iname '*.aac'  -o -iname '*.flac' -o -iname '*.svg'  -o \
+            -iname '*.ttf'  -o -iname '*.otf'  -o -iname '*.woff' -o \
+            -iname '*.woff2' -o -iname '*.so' \
+            \) -delete
+          find out -type d -empty -delete
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}-decompiled
+          path: out/
+          retention-days: 7

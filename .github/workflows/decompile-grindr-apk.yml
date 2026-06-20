@@ -2,16 +2,30 @@ name: Decompile Grindr APK
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: '0 6 * * 1'
+  # Invoked by check-grindr-version.yml once a day when APKPure has a build we
+  # haven't decompiled yet. Still independently runnable via the Run button.
+  workflow_call:
+    outputs:
+      version:
+        description: Decompiled build, as versionName.versionCode (e.g. 26.10.0.166504)
+        value: ${{ jobs.decompile.outputs.version }}
 
+# contents: write is needed to record each decompiled build as a git tag
+# (v<version>), which is the state the daily checker reads to avoid re-runs.
 permissions:
-  contents: read
+  contents: write
+
+# Never let a manual run and the scheduled run decompile the same build at once.
+concurrency:
+  group: decompile-grindr
+  cancel-in-progress: false
 
 jobs:
   decompile:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     env:
       PACKAGE: com.grindrapp.android
       JADX_VERSION: 1.5.5
@@ -87,6 +101,29 @@ jobs:
           # `| head` + pipefail/errexit (GitHub's default shell) would fail the
           # step via SIGPIPE once ls outruns head, so swallow the pipe result.
           ls -R out 2>/dev/null | head -n 50 || true
+
+      - name: Read app version from the manifest
+        id: ver
+        run: |
+          set -euo pipefail
+          # jadx decodes AndroidManifest.xml to text; only the base split carries
+          # versionName, so pick the manifest that has it (config splits don't).
+          manifest="$(grep -rlE 'versionName="' out/resources --include=AndroidManifest.xml | head -1)"
+          [ -n "$manifest" ] || { echo "::error::no AndroidManifest.xml with versionName found"; exit 1; }
+          echo "Reading version from: $manifest"
+          name="$(grep -oE 'versionName="[^"]+"' "$manifest" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+          code="$(grep -oE 'versionCode="[0-9]+"' "$manifest" | head -1 | sed -E 's/.*"([0-9]+)".*/\1/')"
+          if [ -z "$name" ] || [ -z "$code" ]; then
+            echo "::error::could not parse versionName ('$name') / versionCode ('$code')"; exit 1
+          fi
+          version="${name}.${code}"
+          echo "versionName=$name  versionCode=$code  ->  $version"
+          {
+            echo "name=$name"
+            echo "code=$code"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "### Grindr \`$version\` (versionName $name, build $code)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Drop compiled bytecode and binary / media assets
         run: |
@@ -222,6 +259,9 @@ jobs:
           du -sh out 2>/dev/null || true
 
       - name: Compress into a solid zstd archive
+        id: pack
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           # GitHub always stores artifacts as a zip, and zip compresses each of
           # the ~20k files independently (no shared dictionary). Decompiled source
@@ -231,16 +271,40 @@ jobs:
           # widens the match window (27 is the largest that still decompresses with
           # a plain `zstd -d`, no special flag); -T0 uses all runner cores. xz -9e
           # is only ~3% smaller for ~3x the CPU, so zstd is the better CI default.
+          STAMP="$(date -u +%Y-%m-%d)"
+          BASE="${PACKAGE}-${VERSION}-${STAMP}"   # e.g. com.grindrapp.android-26.10.0.166504-2026-06-20
+          ARCHIVE="${BASE}.tar.zst"
           tar -C out -cf - . \
-            | zstd -19 --long=27 -T0 -o "${PACKAGE}-decompiled.tar.zst"
-          ls -lh "${PACKAGE}-decompiled.tar.zst"
+            | zstd -19 --long=27 -T0 -o "$ARCHIVE"
+          ls -lh "$ARCHIVE"
+          # Hand the version+dated names to the upload step (date is UTC).
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "artifact=$BASE"   >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ env.PACKAGE }}-decompiled
-          path: ${{ env.PACKAGE }}-decompiled.tar.zst
+          name: ${{ steps.pack.outputs.artifact }}
+          path: ${{ steps.pack.outputs.archive }}
           # Payload is already compressed; store it (don't let the outer zip that
           # GitHub always adds waste time re-deflating an incompressible blob).
           compression-level: 0
           retention-days: 7
+
+      - name: Record this build as a tag
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          # The daily checker treats "a tag v<version> exists" as "already
+          # decompiled". Create it via the API (no checkout needed) against the
+          # commit this run started from. Idempotent: skip if it already exists.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "Tag v${VERSION} already exists; nothing to record."
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/v${VERSION}" \
+              -f sha="${GITHUB_SHA}" >/dev/null
+            echo "Recorded tag v${VERSION}"
+          fi

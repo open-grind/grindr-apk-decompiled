@@ -88,9 +88,16 @@ jobs:
           # step via SIGPIPE once ls outruns head, so swallow the pipe result.
           ls -R out 2>/dev/null | head -n 50 || true
 
-      - name: Strip binary / media assets, keep XML + sources
+      - name: Drop compiled bytecode and binary / media assets
         run: |
+          # jadx copies every APK entry it doesn't decode straight into
+          # out/resources/. That includes the original classes*.dex (the compiled
+          # input we already decompiled into out/sources/, tens of MB each) and
+          # resources.arsc (the binary table jadx already decoded into res/values*).
+          # Neither is useful for reading or diffing source, so drop them alongside
+          # media and fonts.
           find out -type f \( \
+            -iname '*.dex'  -o -iname '*.arsc' -o \
             -iname '*.png'  -o -iname '*.jpg'  -o -iname '*.jpeg' -o \
             -iname '*.webp' -o -iname '*.gif'  -o -iname '*.bmp'  -o \
             -iname '*.mp3'  -o -iname '*.mp4'  -o -iname '*.webm' -o \
@@ -99,10 +106,73 @@ jobs:
             -iname '*.ttf'  -o -iname '*.otf'  -o -iname '*.woff' -o \
             -iname '*.woff2' -o -iname '*.so' \
             \) -delete
-          find out -type d -empty -delete
+
+      - name: Drop graphical resources, keep values/config XML
+        run: |
+          # res/drawable* and res/mipmap* are presentation assets (vector-drawable
+          # XML, shapes, launcher icons), not the static config we care about.
+          # These are Android resource *type* directory names — a documented, stable
+          # scheme — so matching by name is a principled rule, not a hardcoded path.
+          # Everything else (res/values*, res/xml/, res/raw/, layouts, assets/,
+          # AndroidManifest.xml) is kept.
+          find out -type d \( -iname 'drawable*' -o -iname 'mipmap*' \) \
+            -prune -exec rm -rf {} +
+
+      - name: Drop well-known third-party SDKs from sources
+        run: |
+          # Read before editing VENDORS:
+          #   * Default is KEEP. We delete only namespaces positively identified as
+          #     public third-party SDKs (source available online). Anything we can't
+          #     identify — first-party Grindr code AND private/closed deps we can't
+          #     re-find elsewhere — is left untouched by construction.
+          #   * Entries are reverse-DNS prefixes at vendor-identifying depth
+          #     (com/google, io/bidmachine). A reverse-DNS prefix names its owner, so
+          #     it cannot collide with first-party code: Grindr won't ship classes
+          #     under com/google or androidx.
+          #   * NEVER add a bare TLD (com, org, io, net) or com/grindrapp here.
+          #   * Use the size report in the next step to spot new vendors per build
+          #     and grow this list from data, not by guessing.
+          VENDORS=(
+            androidx
+            android/support
+            com/google          # GMS, Firebase, gson, protobuf, recaptcha, ...
+            com/android
+            kotlin
+            kotlinx
+            org/jetbrains
+            org/intellij
+            com/facebook        # Facebook SDK + com/facebook/ads
+            com/squareup
+            okhttp3
+            okio
+            retrofit2
+            com/bumptech/glide
+            io/reactivex
+            io/bidmachine       # programmatic-ads SDK
+            dagger
+            javax/inject
+            javax/annotation
+            org/apache
+            org/json
+          )
+          for v in "${VENDORS[@]}"; do
+            rm -rf "out/sources/$v"
+          done
+
+      - name: Prune empty directories
+        run: find out -type d -empty -delete
+
+      - name: Report remaining namespaces by size
+        run: |
+          # Surfaces the biggest surviving namespaces so new third-party SDKs are
+          # easy to spot and add to VENDORS deliberately, from data.
+          echo "=== out/sources namespaces by size (depth 2) ==="
+          du -h --max-depth=2 out/sources 2>/dev/null | sort -rh | head -n 40 || true
+          echo "=== total kept ==="
+          du -sh out 2>/dev/null || true
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PACKAGE }}-decompiled
           path: out/

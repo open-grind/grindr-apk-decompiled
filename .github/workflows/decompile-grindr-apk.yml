@@ -83,7 +83,7 @@ jobs:
           # it reads the bundle and merges base + split APKs into one tree.
           mapfile -t INPUTS < <(find apks -maxdepth 1 -type f \( -name '*.xapk' -o -name '*.apk' -o -name '*.apkm' \))
           echo "Decompiling: ${INPUTS[*]}"
-          ./jadx/bin/jadx --no-debug-info --threads-count 2 -d out "${INPUTS[@]}" || true
+          ./jadx/bin/jadx --no-debug-info --threads-count 4 -d out "${INPUTS[@]}" || true
           # `| head` + pipefail/errexit (GitHub's default shell) would fail the
           # step via SIGPIPE once ls outruns head, so swallow the pipe result.
           ls -R out 2>/dev/null | head -n 50 || true
@@ -104,8 +104,11 @@ jobs:
             -iname '*.ogg'  -o -iname '*.wav'  -o -iname '*.m4a'  -o \
             -iname '*.aac'  -o -iname '*.flac' -o -iname '*.svg'  -o \
             -iname '*.ttf'  -o -iname '*.otf'  -o -iname '*.woff' -o \
-            -iname '*.woff2' -o -iname '*.so' \
+            -iname '*.woff2' -o -iname '*.so'  -o \
+            -name 'stamp-cert-sha256' \
             \) -delete
+          # jadx leaks its own working dir into the output tree; never useful.
+          rm -rf out/resources/tmp
 
       - name: Drop graphical resources, keep values/config XML
         run: |
@@ -132,31 +135,78 @@ jobs:
           #   * NEVER add a bare TLD (com, org, io, net) or com/grindrapp here.
           #   * Use the size report in the next step to spot new vendors per build
           #     and grow this list from data, not by guessing.
+          # NOTE: closed-source third-party SDKs are deliberately NOT here. We
+          # keep them because their source can't be found online, so this dump is
+          # the only way to read them — currently com/facetec, io/agora, ly/img,
+          # com/appsflyer, siftscience + com/sift, com/pairip. Don't add them.
           VENDORS=(
+            # Google / AndroidX / Kotlin / general OSS plumbing
             androidx
             android/support
             com/google          # GMS, Firebase, gson, protobuf, recaptcha, ...
             com/android
+            org/chromium        # Cronet
             kotlin
             kotlinx
             org/jetbrains
             org/intellij
-            com/facebook        # Facebook SDK + com/facebook/ads
+            org/checkerframework
+            org/bouncycastle
             com/squareup
             okhttp3
             okio
             retrofit2
+            coil3               # image loader
             com/bumptech/glide
+            com/airbnb          # Lottie / Epoxy
             io/reactivex
-            io/bidmachine       # programmatic-ads SDK
             dagger
             javax/inject
             javax/annotation
             org/apache
             org/json
+            io/jsonwebtoken
+            io/requery
+            io/michaelrocks     # libphonenumber-android / paranoid
+            com/jakewharton
+            timber
+            bolts
+            com/getkeepsafe     # relinker
+            com/zhuinden        # simple-stack
+            dev/zacsweers
+            pl/droidsonroids    # gif-drawable
+            nl/dionsegijn       # konfetti
+            ch/hsr              # geohash
+            com/abangfadli
+            com/chuckerteam     # chucker
+            com/canhub          # image cropper
+            com/ketch           # download manager
+            com/spotify         # app-remote SDK
+            # Ad networks / mediation / measurement (public SDKs)
+            com/facebook        # Facebook SDK + com/facebook/ads
+            io/bidmachine
+            com/mbridge         # Mintegral
+            com/ironsource
+            com/fyber
+            com/digitalturbine
+            com/inmobi
+            com/unity3d
+            gatewayprotocol     # Unity Ads generated protobuf
+            com/applovin
+            com/explorestack    # Appodeal
+            net/pubnative       # Verve
+            com/vungle
+            com/pubmatic
+            com/iab             # IAB OMID / TCF consent
+            com/braze           # Braze SDK ...
+            bo/app              # ... and its obfuscated runtime package
           )
           for v in "${VENDORS[@]}"; do
             rm -rf "out/sources/$v"
+            # Same owners often ship data blobs under assets/ (e.g. libphonenumber
+            # metadata); apply the identical denylist there. The */ glob spans the
+            # per-split-APK dirs jadx creates from the .xapk bundle.
+            rm -rf out/resources/*/assets/"$v"
           done
 
       - name: Prune empty directories
@@ -171,9 +221,26 @@ jobs:
           echo "=== total kept ==="
           du -sh out 2>/dev/null || true
 
+      - name: Compress into a solid zstd archive
+        run: |
+          # GitHub always stores artifacts as a zip, and zip compresses each of
+          # the ~20k files independently (no shared dictionary). Decompiled source
+          # is hugely repetitive across files, so packing everything into one solid
+          # stream — tar piped through zstd — roughly halves the result vs the
+          # default zip (measured on this app: ~39 MB zip -> ~20 MB). --long=27
+          # widens the match window (27 is the largest that still decompresses with
+          # a plain `zstd -d`, no special flag); -T0 uses all runner cores. xz -9e
+          # is only ~3% smaller for ~3x the CPU, so zstd is the better CI default.
+          tar -C out -cf - . \
+            | zstd -19 --long=27 -T0 -o "${PACKAGE}-decompiled.tar.zst"
+          ls -lh "${PACKAGE}-decompiled.tar.zst"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PACKAGE }}-decompiled
-          path: out/
+          path: ${{ env.PACKAGE }}-decompiled.tar.zst
+          # Payload is already compressed; store it (don't let the outer zip that
+          # GitHub always adds waste time re-deflating an incompressible blob).
+          compression-level: 0
           retention-days: 7

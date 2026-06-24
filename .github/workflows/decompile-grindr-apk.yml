@@ -308,3 +308,36 @@ jobs:
               -f sha="${GITHUB_SHA}" >/dev/null
             echo "Recorded tag v${VERSION}"
           fi
+
+      - name: Publish GitHub release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          NAME: ${{ steps.ver.outputs.name }}
+          CODE: ${{ steps.ver.outputs.code }}
+          ARCHIVE: ${{ steps.pack.outputs.archive }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Publish a release for the v<version> tag recorded above, attaching only
+          # the solid zstd archive this run produced. Notes are passed explicitly
+          # (no --generate-notes), so the only content is the build line plus a link
+          # back to this run.
+          # NOTE: GitHub auto-attaches its own "Source code" (zip / tar.gz) assets
+          # to every release from the tag's tree, and offers no API/CLI switch to
+          # hide them — so those two can't be suppressed here.
+          printf '%s\n' \
+            "Decompiled Grindr \`$VERSION\` (versionName $NAME, build $CODE)." \
+            "" \
+            "[GitHub Actions run]($RUN_URL)" > notes.md
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            echo "Release v${VERSION} already exists; updating notes and asset."
+            gh release edit "v${VERSION}" --notes-file notes.md
+            gh release upload "v${VERSION}" "$ARCHIVE" --clobber
+          else
+            gh release create "v${VERSION}" "$ARCHIVE" \
+              --verify-tag \
+              --title "v${VERSION}" \
+              --notes-file notes.md
+          fi

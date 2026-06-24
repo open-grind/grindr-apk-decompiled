@@ -77,3 +77,16 @@ jobs:
     permissions:
       contents: write
     uses: ./.github/workflows/decompile-grindr-apk.yml
+
+  keepalive:
+    name: Keep schedule alive
+    # A public repo's scheduled workflow is auto-disabled after 60 days with no
+    # repository activity, and a workflow run does NOT count as activity. This
+    # re-enables the workflow via the GitHub API on every scheduled run (no
+    # dummy commits — those risk a ToS violation). Needs only actions: write.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: liskin/gh-workflow-keepalive@f72ff1a1336129f29bf0166c0fd0ca6cf1bcb38c # v1.2.1

@@ -28,13 +28,15 @@ jobs:
     steps:
       - name: Install apkeep
         run: |
+          # SHA-256 pins for apkeep ${APKEEP_VERSION}; update when APKEEP_VERSION changes.
           case "$(uname -m)" in
-            x86_64)        ARCH=x86_64 ;;
-            aarch64|arm64) ARCH=aarch64 ;;
+            x86_64)        ARCH=x86_64;  SHA256=a23579a3ba366d25a6d69848189b983d65662f4ecf4b9e11e16510811659de4e ;;
+            aarch64|arm64) ARCH=aarch64; SHA256=5410acebd1b69427adcf98ccfdda6fa4dd3201e0540e5e2c01037b68e0a84049 ;;
             *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
           esac
           curl -fL -o apkeep \
             "https://github.com/EFForg/apkeep/releases/download/${APKEEP_VERSION}/apkeep-${ARCH}-unknown-linux-gnu"
+          echo "${SHA256}  apkeep" | sha256sum -c -
           chmod +x apkeep
           sudo mv apkeep /usr/local/bin/apkeep
           apkeep --version

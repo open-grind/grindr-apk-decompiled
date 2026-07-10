@@ -42,13 +42,15 @@ jobs:
           # GitHub-hosted ubuntu-latest is x86_64, but pick the matching
           # prebuilt binary so this also runs natively on arm64 runners (and
           # under `act` on Apple Silicon).
+          # SHA-256 pins for apkeep ${APKEEP_VERSION}; update when APKEEP_VERSION changes.
           case "$(uname -m)" in
-            x86_64)        ARCH=x86_64 ;;
-            aarch64|arm64) ARCH=aarch64 ;;
+            x86_64)        ARCH=x86_64;  SHA256=a23579a3ba366d25a6d69848189b983d65662f4ecf4b9e11e16510811659de4e ;;
+            aarch64|arm64) ARCH=aarch64; SHA256=5410acebd1b69427adcf98ccfdda6fa4dd3201e0540e5e2c01037b68e0a84049 ;;
             *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
           esac
           curl -fL -o apkeep \
             "https://github.com/EFForg/apkeep/releases/download/${APKEEP_VERSION}/apkeep-${ARCH}-unknown-linux-gnu"
+          echo "${SHA256}  apkeep" | sha256sum -c -
           chmod +x apkeep
           sudo mv apkeep /usr/local/bin/apkeep
           apkeep --version
@@ -88,6 +90,8 @@ jobs:
         run: |
           curl -fL -o jadx.zip \
             "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
+          # SHA-256 pin for jadx ${JADX_VERSION}; update when JADX_VERSION changes.
+          echo "38a5766d3c8170c41566b4b13ea0ede2430e3008421af4927235c2880234d51a  jadx.zip" | sha256sum -c -
           unzip -q jadx.zip -d jadx
           chmod +x jadx/bin/jadx
 
@@ -97,7 +101,46 @@ jobs:
           # it reads the bundle and merges base + split APKs into one tree.
           mapfile -t INPUTS < <(find apks -maxdepth 1 -type f \( -name '*.xapk' -o -name '*.apk' -o -name '*.apkm' \))
           echo "Decompiling: ${INPUTS[*]}"
-          ./jadx/bin/jadx --no-debug-info --threads-count 4 -d out "${INPUTS[@]}" || true
+          # Flags chosen to recover as much method *logic* as possible. Two distinct jadx
+          # failure modes silently drop logic; each flag fixes one. Numbers below are a
+          # measured before/after on this app (26.9.2 APK, same input, flags the only change):
+          #   --show-bad-code         When jadx produces control-flow it can't restructure into
+          #                           valid Java it otherwise emits ONLY `throw new
+          #                           UnsupportedOperationException("Method not decompiled")` and
+          #                           drops the body. This flag keeps the inconsistent-but-real
+          #                           body instead. Effect: methods with no clean Java 6369 ->
+          #                           205 (~6.2k bodies recovered). The ~205 residual are mostly
+          #                           Kotlin synthetic ctors neither mode can restructure — and
+          #                           those still carry a raw-instruction dump (see next).
+          #   --comments-level debug  At the default 'info' level jadx skips the body of any
+          #                           method over a size threshold entirely, leaving only
+          #                           "Method dump skipped ... add '--comments-level debug'" —
+          #                           and it's the biggest methods that get cut (e.g. the
+          #                           request-signing message builder). At 'debug' level they
+          #                           come back as their full raw Dalvik-instruction dump in a
+          #                           comment. Effect: fully-skipped bodies 2824 -> 0. Recovered
+          #                           form is bytecode, NOT clean Java, but fully traceable.
+          #   --no-debug-info         Kept: an obfuscated release build carries ~none, and
+          #                           omitting it keeps output stable for cross-version diffing.
+          # (Total source grows ~10% from the recovered bodies — a good trade.)
+          # Memory is NOT the bottleneck: the jadx launcher already runs at
+          # MaxRAMPercentage=70 (~11 GB on the 16 GB runner), so skipped bodies are decompiler
+          # limits, not OOM — no -Xmx override needed. -m fallback would recover 100% but as raw
+          # instructions for *every* method (unreadable); use it ad hoc on one class, not here.
+          ./jadx/bin/jadx \
+            --no-debug-info \
+            --show-bad-code \
+            --comments-level debug \
+            --threads-count 4 \
+            -d out "${INPUTS[@]}" || true
+          # Recovery signal, build over build. The meaningful number is fully-bodiless
+          # methods: with --comments-level debug it should stay ~0 (every method keeps at
+          # least its raw instructions); a jump means jadx regressed or hit a new size wall.
+          # ("Method not decompiled" is reported too but is only a *clean-Java* miss — those
+          # methods still carry a raw-instruction dump above the throw, so it won't hit zero.)
+          echo "=== decompile recovery ==="
+          echo "fully-skipped bodies (want ~0): $(grep -rho 'Method dump skipped' out/sources 2>/dev/null | wc -l)"
+          echo "no clean Java (has raw insns):  $(grep -rho 'Method not decompiled' out/sources 2>/dev/null | wc -l)"
           # `| head` + pipefail/errexit (GitHub's default shell) would fail the
           # step via SIGPIPE once ls outruns head, so swallow the pipe result.
           ls -R out 2>/dev/null | head -n 50 || true

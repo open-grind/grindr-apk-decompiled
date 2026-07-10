@@ -10,8 +10,9 @@ on:
         description: Decompiled build, as versionName.versionCode (e.g. 26.10.0.166504)
         value: ${{ jobs.decompile.outputs.version }}
 
-# contents: write is needed to record each decompiled build as a git tag
-# (v<version>), which is the state the daily checker reads to avoid re-runs.
+# contents: write is needed to publish each decompiled build as a GitHub release
+# (which also creates its v<version> tag) — the release is the state the daily
+# checker reads to avoid re-runs.
 permissions:
   contents: write
 
@@ -334,28 +335,15 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-      - name: Record this build as a tag
+      - name: Publish GitHub release (creates its v<version> tag atomically)
         if: success()
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.ver.outputs.version }}
-        run: |
-          # The daily checker treats "a tag v<version> exists" as "already
-          # decompiled". Create it via the API (no checkout needed) against the
-          # commit this run started from. Idempotent: skip if it already exists.
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${VERSION}" >/dev/null 2>&1; then
-            echo "Tag v${VERSION} already exists; nothing to record."
-          else
-            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref="refs/tags/v${VERSION}" \
-              -f sha="${GITHUB_SHA}" >/dev/null
-            echo "Recorded tag v${VERSION}"
-          fi
-
-      - name: Publish GitHub release
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
+          # No actions/checkout runs in this job, so `gh` has no local git repo to
+          # infer the target from — without GH_REPO every `gh release` call dies with
+          # "fatal: not a git repository". `gh api` calls elsewhere pass the repo in
+          # the path, so they were unaffected; `gh release` needs this.
+          GH_REPO: ${{ github.repository }}
           VERSION: ${{ steps.ver.outputs.version }}
           NAME: ${{ steps.ver.outputs.name }}
           CODE: ${{ steps.ver.outputs.code }}
@@ -363,13 +351,15 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          # Publish a release for the v<version> tag recorded above, attaching only
-          # the solid zstd archive this run produced. Notes are passed explicitly
-          # (no --generate-notes), so the only content is the build line plus a link
-          # back to this run.
-          # NOTE: GitHub auto-attaches its own "Source code" (zip / tar.gz) assets
-          # to every release from the tag's tree, and offers no API/CLI switch to
-          # hide them — so those two can't be suppressed here.
+          # `gh release create` creates the release AND its v<version> tag in one call
+          # (pointing the tag at this run's commit via --target). This is the ONLY step
+          # that writes either — done last, on success — so the tag/release always
+          # appear together. A run that fails before here leaves neither, and since the
+          # daily checker keys off the *release* (not the tag), the next run retries the
+          # version instead of skipping one that was tagged but never published.
+          # Notes are passed explicitly (no --generate-notes): just the build line and a
+          # link back to this run. GitHub also auto-attaches "Source code" zip/tar.gz to
+          # every release with no switch to hide them, so those two can't be suppressed.
           printf '%s\n' \
             "Decompiled Grindr \`$VERSION\` (versionName $NAME, build $CODE)." \
             "" \
@@ -380,7 +370,7 @@ jobs:
             gh release upload "v${VERSION}" "$ARCHIVE" --clobber
           else
             gh release create "v${VERSION}" "$ARCHIVE" \
-              --verify-tag \
+              --target "$GITHUB_SHA" \
               --title "v${VERSION}" \
               --notes-file notes.md
           fi

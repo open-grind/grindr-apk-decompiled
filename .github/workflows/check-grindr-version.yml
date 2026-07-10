@@ -61,9 +61,14 @@ jobs:
           echo "Latest available versionName: $latest"
           echo "version=$latest" >> "$GITHUB_OUTPUT"
 
-          # "Already decompiled" == a tag v<versionName>.<build> exists. The
-          # trailing dot pins the boundary so 26.10.0 can't match 26.10.01.
-          count="$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v${latest}." --jq 'length' 2>/dev/null || echo 0)"
+          # "Already decompiled" == a published RELEASE tagged v<versionName>.<build>
+          # exists. Keying off the release (not just the tag) is deliberate: a run that
+          # tagged a build but died before publishing must NOT be skipped forever — with
+          # no release, the next run retries it. Trailing dot pins the boundary so
+          # 26.10.0 can't match 26.10.01; per_page=100 covers far more than the newest
+          # build ever needs.
+          count="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name | startswith(\"v${latest}.\"))] | length" 2>/dev/null || echo 0)"
           if [ "$count" -gt 0 ]; then
             echo "new=false" >> "$GITHUB_OUTPUT"
             echo "Already decompiled ($count matching tag(s)); nothing to do." >> "$GITHUB_STEP_SUMMARY"
@@ -75,7 +80,8 @@ jobs:
   decompile:
     needs: check
     if: needs.check.outputs.new == 'true'
-    # The reusable workflow records a tag, so it needs write granted by us.
+    # The reusable workflow publishes a GitHub release (and its tag), so it needs
+    # write granted by us.
     permissions:
       contents: write
     uses: ./.github/workflows/decompile-grindr-apk.yml

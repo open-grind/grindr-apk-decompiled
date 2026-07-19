@@ -2,11 +2,14 @@ name: Check Grindr version
 
 on:
   schedule:
-    # Daily at 06:00 UTC. Cheap: just asks APKPure what the latest version is.
+    # Daily at 06:00 UTC. Downloads the current Google Play build and decompiles
+    # it only if we don't already have that versionCode released. Google Play has
+    # no cheap "list versions" endpoint, so the worker below downloads first and
+    # self-gates on the APK's real manifest version — there's nothing to pre-check
+    # here, this workflow just schedules the worker and keeps the cron alive.
     - cron: '0 6 * * *'
   workflow_dispatch:
 
-# Only reading refs here; the decompile job below requests write for its tag.
 permissions:
   contents: read
 
@@ -15,75 +18,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      PACKAGE: com.grindrapp.android
-      APKEEP_VERSION: 1.0.0
-      GH_TOKEN: ${{ github.token }}
-    outputs:
-      new: ${{ steps.decide.outputs.new }}
-      version: ${{ steps.decide.outputs.version }}
-    steps:
-      - name: Install apkeep
-        run: |
-          # SHA-256 pins for apkeep ${APKEEP_VERSION}; update when APKEEP_VERSION changes.
-          case "$(uname -m)" in
-            x86_64)        ARCH=x86_64;  SHA256=a23579a3ba366d25a6d69848189b983d65662f4ecf4b9e11e16510811659de4e ;;
-            aarch64|arm64) ARCH=aarch64; SHA256=5410acebd1b69427adcf98ccfdda6fa4dd3201e0540e5e2c01037b68e0a84049 ;;
-            *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
-          esac
-          curl -fL -o apkeep \
-            "https://github.com/EFForg/apkeep/releases/download/${APKEEP_VERSION}/apkeep-${ARCH}-unknown-linux-gnu"
-          echo "${SHA256}  apkeep" | sha256sum -c -
-          chmod +x apkeep
-          sudo mv apkeep /usr/local/bin/apkeep
-          apkeep --version
-
-      - name: Decide whether a new version needs decompiling
-        id: decide
-        run: |
-          set -euo pipefail
-
-          # APKPure supports listing versions without downloading the APK, so this
-          # stays quick. Don't trust the listing order — extract every versionName
-          # token and take the highest with a version sort.
-          echo "::group::apkeep list-versions"
-          apkeep -l -a "$PACKAGE" -d apk-pure | tee versions.txt
-          echo "::endgroup::"
-
-          latest="$(grep -oE '[0-9]+(\.[0-9]+){1,3}' versions.txt | sort -rV | head -1 || true)"
-          if [ -z "$latest" ]; then
-            echo "::error::could not parse any version from apkeep output (format may have changed)"
-            exit 1
-          fi
-          echo "Latest available versionName: $latest"
-          echo "version=$latest" >> "$GITHUB_OUTPUT"
-
-          # "Already decompiled" == a published RELEASE tagged v<versionName>.<build>
-          # exists. Keying off the release (not just the tag) is deliberate: a run that
-          # tagged a build but died before publishing must NOT be skipped forever — with
-          # no release, the next run retries it. Trailing dot pins the boundary so
-          # 26.10.0 can't match 26.10.01; per_page=100 covers far more than the newest
-          # build ever needs.
-          count="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq "[.[] | select(.tag_name | startswith(\"v${latest}.\"))] | length" 2>/dev/null || echo 0)"
-          if [ "$count" -gt 0 ]; then
-            echo "new=false" >> "$GITHUB_OUTPUT"
-            echo "Already decompiled ($count matching tag(s)); nothing to do." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "new=true" >> "$GITHUB_OUTPUT"
-            echo "New version **$latest** is not yet decompiled — triggering decompile." >> "$GITHUB_STEP_SUMMARY"
-          fi
-
   decompile:
-    needs: check
-    if: needs.check.outputs.new == 'true'
-    # The reusable workflow publishes a GitHub release (and its tag), so it needs
-    # write granted by us.
+    # The reusable worker downloads from Google Play, reads the real version, and
+    # publishes a release only when the build is new. It needs the Google Play
+    # secrets (passed via `secrets: inherit`) and contents: write for the release.
     permissions:
       contents: write
+    secrets: inherit
     uses: ./.github/workflows/decompile-grindr-apk.yml
 
   keepalive:

@@ -2,17 +2,20 @@ name: Decompile Grindr APK
 
 on:
   workflow_dispatch:
-  # Invoked by check-grindr-version.yml once a day when APKPure has a build we
-  # haven't decompiled yet. Still independently runnable via the Run button.
+  # Invoked once a day by check-grindr-version.yml. Still independently runnable
+  # via the Run button. Google Play has no "list versions" API (unlike APKPure),
+  # so there is no cheap pre-check: this workflow downloads the current build,
+  # reads its real version from the APK manifest, and self-gates on whether that
+  # build is already published as a release.
   workflow_call:
     outputs:
       version:
-        description: Decompiled build, as versionName.versionCode (e.g. 26.10.0.166504)
+        description: Latest build seen, as versionName.versionCode (e.g. 26.11.0.168192)
         value: ${{ jobs.decompile.outputs.version }}
 
 # contents: write is needed to publish each decompiled build as a GitHub release
-# (which also creates its v<version> tag) — the release is the state the daily
-# checker reads to avoid re-runs.
+# (which also creates its v<version> tag) — the release is the state the gate
+# below reads to avoid re-decompiling a build we already have.
 permissions:
   contents: write
 
@@ -27,22 +30,20 @@ jobs:
     timeout-minutes: 60
     outputs:
       version: ${{ steps.ver.outputs.version }}
+      new: ${{ steps.gate.outputs.new }}
     env:
       PACKAGE: com.grindrapp.android
       JADX_VERSION: 1.5.5
       APKEEP_VERSION: 1.0.0
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
 
     steps:
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y curl unzip file openjdk-17-jre-headless
-
       - name: Install apkeep
         run: |
           # GitHub-hosted ubuntu-latest is x86_64, but pick the matching
           # prebuilt binary so this also runs natively on arm64 runners (and
-          # under `act` on Apple Silicon).
+          # under `act` on Apple Silicon). curl is preinstalled on the runner.
           # SHA-256 pins for apkeep ${APKEEP_VERSION}; update when APKEEP_VERSION changes.
           case "$(uname -m)" in
             x86_64)        ARCH=x86_64;  SHA256=a23579a3ba366d25a6d69848189b983d65662f4ecf4b9e11e16510811659de4e ;;
@@ -56,38 +57,114 @@ jobs:
           sudo mv apkeep /usr/local/bin/apkeep
           apkeep --version
 
-      - name: Download APK (apkeep, APKPure, no auth)
+      - name: Download latest build from Google Play
+        env:
+          GOOGLE_PLAY_EMAIL: ${{ secrets.GOOGLE_PLAY_EMAIL }}
+          GOOGLE_PLAY_AAS_TOKEN: ${{ secrets.GOOGLE_PLAY_AAS_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${GOOGLE_PLAY_EMAIL:-}" ] || [ -z "${GOOGLE_PLAY_AAS_TOKEN:-}" ]; then
+            echo "::error::GOOGLE_PLAY_EMAIL / GOOGLE_PLAY_AAS_TOKEN repository secrets are not set. See README for how to mint an AAS token."
+            exit 1
+          fi
           mkdir -p apks
 
-          # apkeep's default download source is apk-pure, which needs no
-          # account or token and runs non-interactively. For an app with
-          # splits (like Grindr) it produces a single <package>.xapk bundle;
-          # simpler apps come down as <package>.apk. Retry purely for network
-          # robustness.
+          # Google Play serves Grindr as an App Bundle (base + config splits), so
+          # split_apk=true is required — there is no single monolithic APK to fall
+          # back to. apkeep pulls the base plus the splits for the default device
+          # profile (px_9a / Pixel 9a, locale en_US, tz UTC); jadx merges them.
+          # --accept-tos auto-accepts Play's ToS on a first run with a fresh
+          # account. Credentials come from env (never interpolated into the log).
+          # Retry purely for network robustness.
           attempt=0
           max=3
           until [ "$attempt" -ge "$max" ]; do
             attempt=$((attempt + 1))
-            echo "::group::Attempt ${attempt}/${max}: apkeep download"
-            if apkeep -a "$PACKAGE" -d apk-pure apks; then
+            echo "::group::Attempt ${attempt}/${max}: apkeep google-play download"
+            if apkeep -a "$PACKAGE" -d google-play \
+                 -e "$GOOGLE_PLAY_EMAIL" -t "$GOOGLE_PLAY_AAS_TOKEN" \
+                 --accept-tos -o split_apk=true apks; then
               echo "::endgroup::"
               break
             fi
             echo "::endgroup::"
-            echo "Download failed; retrying in 5s..."
-            sleep 5
+            echo "Download failed; retrying in 10s..."
+            sleep 10
           done
 
           echo "=== downloaded files ==="
           ls -lhR apks
-          if [ -z "$(find apks -maxdepth 1 -type f \( -name '*.xapk' -o -name '*.apk' -o -name '*.apkm' \) -print -quit)" ]; then
-            echo "::error::No APK/XAPK downloaded after ${max} attempts."
+          if [ -z "$(find apks -type f -name '*.apk' -print -quit)" ]; then
+            echo "::error::No APK downloaded from Google Play after ${max} attempts (check credentials, account region, or whether the AAS token expired)."
             exit 1
           fi
 
+      - name: Read app version from the base APK
+        id: ver
+        run: |
+          set -euo pipefail
+          # ubuntu-latest ships the Android SDK, so use its aapt2 to read the
+          # version WITHOUT a full jadx decompile — that lets the gate below skip
+          # the expensive steps for a build we already have. Grindr comes down as
+          # base + config splits; the base split is the one whose badging carries
+          # a non-empty versionName and no `split=` marker (config splits inherit
+          # the versionCode but report an empty versionName).
+          AAPT2="$(find "${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}/build-tools" -name aapt2 2>/dev/null | sort -V | tail -1 || true)"
+          [ -n "$AAPT2" ] && [ -x "$AAPT2" ] || AAPT2="$(command -v aapt2 || true)"
+          [ -n "$AAPT2" ] || { echo "::error::aapt2 not found on runner"; exit 1; }
+          echo "Using aapt2: $AAPT2"
+
+          name=""
+          code=""
+          while IFS= read -r f; do
+            badge="$("$AAPT2" dump badging "$f" 2>/dev/null || true)"
+            if printf '%s\n' "$badge" | grep -q "split="; then
+              continue
+            fi
+            n="$(printf '%s\n' "$badge" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -1)"
+            c="$(printf '%s\n' "$badge" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -1)"
+            if [ -n "$n" ] && [ -n "$c" ]; then
+              name="$n"; code="$c"; break
+            fi
+          done < <(find apks -type f -name '*.apk')
+
+          if [ -z "$name" ] || [ -z "$code" ]; then
+            echo "::error::could not read versionName/versionCode from the downloaded APK"
+            exit 1
+          fi
+          version="${name}.${code}"
+          echo "versionName=$name  versionCode=$code  ->  $version"
+          {
+            echo "name=$name"
+            echo "code=$code"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether this build is already decompiled
+        id: gate
+        run: |
+          set -euo pipefail
+          # "Already decompiled" == a published RELEASE tagged v<versionName>.<build>
+          # exists. Keying off the release (not just the tag) is deliberate: a run
+          # that tagged a build but died before publishing must NOT be skipped
+          # forever — with no release, the next run retries it.
+          version="${{ steps.ver.outputs.version }}"
+          if gh release view "v${version}" >/dev/null 2>&1; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+            echo "Grindr \`$version\` already decompiled; nothing to do." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+            echo "New Grindr build **$version** is not yet decompiled — decompiling." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install build tools
+        if: steps.gate.outputs.new == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip file openjdk-17-jre-headless
+
       - name: Install jadx
+        if: steps.gate.outputs.new == 'true'
         run: |
           curl -fL -o jadx.zip \
             "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip"
@@ -97,14 +174,13 @@ jobs:
           chmod +x jadx/bin/jadx
 
       - name: Decompile
+        if: steps.gate.outputs.new == 'true'
         run: |
-          # Hand jadx whatever apkeep produced (.xapk bundle or plain .apk);
-          # it reads the bundle and merges base + split APKs into one tree.
-          mapfile -t INPUTS < <(find apks -maxdepth 1 -type f \( -name '*.xapk' -o -name '*.apk' -o -name '*.apkm' \))
-          echo "Decompiling: ${INPUTS[*]}"
-          # Flags chosen to recover as much method *logic* as possible. Two distinct jadx
-          # failure modes silently drop logic; each flag fixes one. Numbers below are a
-          # measured before/after on this app (26.9.2 APK, same input, flags the only change):
+          # Hand jadx every APK apkeep produced (base + splits); it merges them
+          # into one tree. Flags chosen to recover as much method *logic* as
+          # possible. Two distinct jadx failure modes silently drop logic; each
+          # flag fixes one. Numbers below are a measured before/after on this app
+          # (26.9.2 APK, same input, flags the only change):
           #   --show-bad-code         When jadx produces control-flow it can't restructure into
           #                           valid Java it otherwise emits ONLY `throw new
           #                           UnsupportedOperationException("Method not decompiled")` and
@@ -128,6 +204,8 @@ jobs:
           # MaxRAMPercentage=70 (~11 GB on the 16 GB runner), so skipped bodies are decompiler
           # limits, not OOM — no -Xmx override needed. -m fallback would recover 100% but as raw
           # instructions for *every* method (unreadable); use it ad hoc on one class, not here.
+          mapfile -t INPUTS < <(find apks -type f \( -name '*.xapk' -o -name '*.apk' -o -name '*.apkm' \))
+          echo "Decompiling: ${INPUTS[*]}"
           ./jadx/bin/jadx \
             --no-debug-info \
             --show-bad-code \
@@ -146,30 +224,8 @@ jobs:
           # step via SIGPIPE once ls outruns head, so swallow the pipe result.
           ls -R out 2>/dev/null | head -n 50 || true
 
-      - name: Read app version from the manifest
-        id: ver
-        run: |
-          set -euo pipefail
-          # jadx decodes AndroidManifest.xml to text; only the base split carries
-          # versionName, so pick the manifest that has it (config splits don't).
-          manifest="$(grep -rlE 'versionName="' out/resources --include=AndroidManifest.xml | head -1)"
-          [ -n "$manifest" ] || { echo "::error::no AndroidManifest.xml with versionName found"; exit 1; }
-          echo "Reading version from: $manifest"
-          name="$(grep -oE 'versionName="[^"]+"' "$manifest" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
-          code="$(grep -oE 'versionCode="[0-9]+"' "$manifest" | head -1 | sed -E 's/.*"([0-9]+)".*/\1/')"
-          if [ -z "$name" ] || [ -z "$code" ]; then
-            echo "::error::could not parse versionName ('$name') / versionCode ('$code')"; exit 1
-          fi
-          version="${name}.${code}"
-          echo "versionName=$name  versionCode=$code  ->  $version"
-          {
-            echo "name=$name"
-            echo "code=$code"
-            echo "version=$version"
-          } >> "$GITHUB_OUTPUT"
-          echo "### Grindr \`$version\` (versionName $name, build $code)" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Drop compiled bytecode and binary / media assets
+        if: steps.gate.outputs.new == 'true'
         run: |
           # jadx copies every APK entry it doesn't decode straight into
           # out/resources/. That includes the original classes*.dex (the compiled
@@ -192,6 +248,7 @@ jobs:
           rm -rf out/resources/tmp
 
       - name: Drop graphical resources, keep values/config XML
+        if: steps.gate.outputs.new == 'true'
         run: |
           # res/drawable* and res/mipmap* are presentation assets (vector-drawable
           # XML, shapes, launcher icons), not the static config we care about.
@@ -203,6 +260,7 @@ jobs:
             -prune -exec rm -rf {} +
 
       - name: Drop well-known third-party SDKs from sources
+        if: steps.gate.outputs.new == 'true'
         run: |
           # Read before editing VENDORS:
           #   * Default is KEEP. We delete only namespaces positively identified as
@@ -216,6 +274,14 @@ jobs:
           #   * NEVER add a bare TLD (com, org, io, net) or com/grindrapp here.
           #   * Use the size report in the next step to spot new vendors per build
           #     and grow this list from data, not by guessing.
+          # NOTE ON OBFUSCATION: since 26.10.0 Grindr ships with full-mode R8
+          # (repackaging), which flattens most third-party libraries into the root
+          # package as obfuscated single-letter classes under out/sources/defpackage/.
+          # Those can NO LONGER be matched by their original reverse-DNS namespace,
+          # so this denylist only removes the SDKs that R8 left in a named package
+          # (e.g. Grindr's keep-rules, or SDKs shaded into their own namespace).
+          # defpackage/ is a mix of repackaged Grindr code and repackaged libs and
+          # is deliberately kept whole — don't try to bulk-delete it.
           # NOTE: closed-source third-party SDKs are deliberately NOT here. We
           # keep them because their source can't be found online, so this dump is
           # the only way to read them — currently com/facetec, io/agora, ly/img,
@@ -286,14 +352,16 @@ jobs:
             rm -rf "out/sources/$v"
             # Same owners often ship data blobs under assets/ (e.g. libphonenumber
             # metadata); apply the identical denylist there. The */ glob spans the
-            # per-split-APK dirs jadx creates from the .xapk bundle.
+            # per-split-APK dirs jadx creates from the bundle.
             rm -rf out/resources/*/assets/"$v"
           done
 
       - name: Prune empty directories
+        if: steps.gate.outputs.new == 'true'
         run: find out -type d -empty -delete
 
       - name: Report remaining namespaces by size
+        if: steps.gate.outputs.new == 'true'
         run: |
           # Surfaces the biggest surviving namespaces so new third-party SDKs are
           # easy to spot and add to VENDORS deliberately, from data.
@@ -304,6 +372,7 @@ jobs:
 
       - name: Compress into a solid zstd archive
         id: pack
+        if: steps.gate.outputs.new == 'true'
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
@@ -316,7 +385,7 @@ jobs:
           # a plain `zstd -d`, no special flag); -T0 uses all runner cores. xz -9e
           # is only ~3% smaller for ~3x the CPU, so zstd is the better CI default.
           STAMP="$(date -u +%Y-%m-%d)"
-          BASE="${PACKAGE}-${VERSION}-${STAMP}"   # e.g. com.grindrapp.android-26.10.0.166504-2026-06-20
+          BASE="${PACKAGE}-${VERSION}-${STAMP}"   # e.g. com.grindrapp.android-26.11.0.168192-2026-07-19
           ARCHIVE="${BASE}.tar.zst"
           tar -C out -cf - . \
             | zstd -19 --long=27 -T0 -o "$ARCHIVE"
@@ -326,6 +395,7 @@ jobs:
           echo "artifact=$BASE"   >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
+        if: steps.gate.outputs.new == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.pack.outputs.artifact }}
@@ -336,7 +406,7 @@ jobs:
           retention-days: 7
 
       - name: Publish GitHub release (creates its v<version> tag atomically)
-        if: success()
+        if: steps.gate.outputs.new == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           # No actions/checkout runs in this job, so `gh` has no local git repo to
@@ -355,7 +425,7 @@ jobs:
           # (pointing the tag at this run's commit via --target). This is the ONLY step
           # that writes either — done last, on success — so the tag/release always
           # appear together. A run that fails before here leaves neither, and since the
-          # daily checker keys off the *release* (not the tag), the next run retries the
+          # gate keys off the *release* (not the tag), the next run retries the
           # version instead of skipping one that was tagged but never published.
           # Notes are passed explicitly (no --generate-notes): just the build line and a
           # link back to this run. GitHub also auto-attaches "Source code" zip/tar.gz to
